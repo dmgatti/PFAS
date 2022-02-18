@@ -1,0 +1,219 @@
+---
+title: "PFAS_MM"
+author: "Daniel Gatti"
+date: "02/17/2022"
+output:
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(readxl)
+library(lubridate)
+library(tidyverse)
+
+base_dir = "~/Desktop/Thesis_Project/Data/PFAS/"
+
+base_dir = '/home/dmgatti/Documents/COA/Rachel'
+data_dir  = file.path(base_dir, 'data')
+raw_dir   = file.path(data_dir, 'raw')
+proc_dir  = file.path(data_dir, 'processed')
+data_file = file.path(raw_dir, 'PFAS_sample_list.xlsx')
+uri_file  = file.path(raw_dir, 'URI_lab_work_edited.xlsx')
+results_dir = file.path(base_dir, 'results')
+```
+
+## Introduction
+
+I received two files, one with sample IDs and weights, and one with information about mass spec runs from Univ. of Rhode Island (URI). The goal is to clean and wrangle the sample data and merge it with the URI mass spec data.
+
+The sample file (PFAS_sample_list.xlsx) is in wide format with one row per animal and many columns for each tissue, vial, and parameter. There are potentially three vials for each animal/tissue combination: A, B & C. Only one vial is used for each animal/tissue combination. Vial A or B was used, depending on which one had sufficient tissue. If vials A & B did not contain sufficient tissue, they were combined into vial C. I need to retain the following columns for vials A and B:
+
+```
+'used', 'vial_number', 'sample_ww', 'sample_dw', 'multiplication_factor', 'pct_H2O', 'final_sample_dw', 'analyzed_dw'
+```
+
+For vial C, the column names are different. I need to retain:
+
+```
+'used', 'vial_number', 'combined_ww', 'combined_dw', 'combined_multiplication_factor', 'combined_pct_H2O', 'analyzed_dw'
+```
+
+## Data Cleaning
+
+### Load Data
+
+Read in data from the Excel files.
+
+```{r read_data}
+pfas = read_xlsx(data_file, sheet = 'pfas_mm_sample_list', range = 'A2:OB83', na = '')
+uri  = read_xlsx(uri_file,  sheet = 'sample_progress')
+
+a_columns = c('used', 'vial_number', 'sample_ww',   'sample_dw',   'multiplication_factor',          'pct_H2O',          'final_sample_dw', 'analyzed_dw')
+b_columns = c('used', 'vial_number', 'sample_ww',   'sample_dw',   'multiplication_factor',          'pct_H2O',          'final_sample_dw', 'analyzed_dw')
+c_columns = c('used', 'vial_number', 'combined_ww', 'combined_dw', 'combined_multiplication_factor', 'combined_pct_H2O',                    'analyzed_dw')
+common_columns = c('id', 'tissue', 'vial')
+
+# Get the animal ID.
+animal_id = pull(pfas, animal_ID)
+
+# Tissue names.
+# NOTE: Pancreas is not used. We need it to delineate the end of maggots data.
+tissues = c('liver', 'kidney', 'spleen', 'muscle', 'blubber', 'brain', 'mammary', 'maggots', 'pancreas')
+
+# Fix column names.
+colnames(pfas) = sub('multipication', 'multiplication', colnames(pfas))
+colnames(pfas) = sub('H20', 'H2O', colnames(pfas))
+```
+
+### Wide to Long Format
+
+First, transform the data from wide to long format. We have to do this manually.
+
+```{r data_wide2long}
+colnames(pfas)[1] = 'id'
+new_data = NULL
+
+for(i in 1:(length(tissues) - 1)) {
+  
+  print(tissues[i])
+  
+  # Find the start and end of the current tissue.
+  first_column = grep(tissues[i],     colnames(pfas))
+  last_column  = grep(tissues[i + 1], colnames(pfas)) - 1
+
+  # Get the data for the current tissue.
+  tmp = data.frame(pfas[,first_column:last_column])
+  tmp[,1] = tissues[i]
+  colnames(tmp)[1] = 'tissue'
+  tmp = cbind(id = pfas$id, tmp)
+  
+  # Fix column names. We will have duplicate column names here.
+  colnames(tmp) = sub('(\\.)+[0-9]+$', '', colnames(tmp))
+  colnames(tmp) = gsub('\\.', '_', colnames(tmp))
+  
+  # tmp contains data in wide format for vials A, B & C.
+  # Convert to long format.
+  used_cols = grep('used', colnames(tmp))
+  # A & B vials.
+  vial_a = tmp[,used_cols[1]:(used_cols[2] - 1)]
+  vial_a = cbind(id = tmp$id, tissue = tmp$tissue, vial = 'A', vial_a)
+  vial_a = vial_a[,c(common_columns, a_columns)]
+  
+  vial_b = tmp[,used_cols[2]:(used_cols[3] - 1)]
+  vial_b = cbind(id = tmp$id, tissue = tmp$tissue, vial = 'B', vial_b)
+  vial_b = vial_b[,c(common_columns, b_columns)]
+  
+  # Vial C
+  vial_c = tmp[,used_cols[3]:ncol(tmp)]
+  vial_c = cbind(id = tmp$id, tissue = tmp$tissue, vial = 'C', vial_c)
+  vial_c = vial_c[,c(common_columns, c_columns)]
+  vial_c = cbind(vial_c[,1:(ncol(vial_c) - 1)], final_sample_dw = NA, vial_c[,ncol(vial_c), drop = FALSE])
+  colnames(vial_c) = sub('combined', 'sample', colnames(vial_c))
+  colnames(vial_c) = sub('^sample_multiplication_factor$', 'multiplication_factor', colnames(vial_c))
+  colnames(vial_c) = sub('^sample_pct_H2O$', 'pct_H2O', colnames(vial_c))
+  
+  # Data for vials A, B & C.
+  all_vials = rbind(vial_a,    vial_b)
+  all_vials = rbind(all_vials, vial_c)
+  
+  if(is.null(new_data)) {
+    new_data = all_vials
+  } else {
+    new_data = rbind(new_data, all_vials)
+  } # else
+  
+} # for(i)
+```
+
+Check the number of tissues and vial.
+
+```{r check_tissue_vial}
+count(new_data, tissue, vial)
+```
+
+There are 81 animal IDs, so each tissue and vial should have 81 values.
+
+There are currently `r nrow(new_data)` rows in `new_data`.
+
+### Retain Used Samples
+
+Next, filter the data to retain rows in which 'used == yes'.
+
+```{r filter_used_yes}
+new_data = new_data %>% 
+             mutate(used = str_to_lower(used)) %>% 
+             filter(used == 'yes')
+```
+
+There are now `r nrow(new_data)` rows in `new_data`.
+
+Next we need to verify that each animal ID and tissue is associated with only one vial, A, B or C.
+
+```{r verify_id_tissue}
+new_data %>% 
+  count(id, tissue, vial) %>% 
+  distinct(n)
+```
+
+We see only '1' as the count of id/tissue/vial, indicating that there is only one sample for each id/tissue/vial combination.
+
+### Merge with URI Data
+
+We need to merge the two data sets. The key between the two files will be the id/tissue/vial. We will need to create a key column in each data set to merge by. In the URI data, we will retain the HPLC number, analyzed weight and batch columns.
+
+```{r change_uri_column_names}
+uri = uri %>% 
+        select(id = animal_ID, tissue_type, HPLC_number, analyzed_weight_g_dw, batch = `Batch #`)
+```
+
+Check the animal IDs in each file.
+
+Are all animals in the PFAS file in the URI file?
+
+```{r pfas_in_uri}
+all(pfas$id %in% uri$id)
+```
+
+Are all animals in the URI file in the PFAS file?
+
+```{r uri_in_pfas}
+all(uri$id %in% pfas$id)
+```
+
+What is the intersection of animal IDs?
+
+```{r intersect_animals}
+animal_inter = intersect(uri$id, pfas$id)
+animal_inter
+```
+
+There are `r length(animal_inter)` animals that intersect between the two data sets.
+
+Merge the data sets, retaining the union of all samples in both files.
+
+```{r merge_data}
+new_data = new_data %>% 
+             unite(key, id, tissue, vial, sep = '_', remove = FALSE)
+uri = uri %>% 
+        separate(tissue_type, into = c('tissue', 'vial')) %>% 
+        mutate(tissue = str_to_lower(tissue)) %>% 
+        unite(key, id, tissue, vial, sep = '_', remove = TRUE)
+union_data = full_join(new_data, uri, by = 'key')
+inter_data = inner_join(new_data, uri, by = 'key')
+```
+
+The  union of both data sets contains `r nrow(union_data)` rows. The intersection contains `r nrow(inter_data)` rows.
+
+## Write Data
+
+Write the data out to *.csv files.
+
+```{r write_data}
+write_csv(union_data, file = file.path(results_dir, 'pfas_samples_union.csv'))
+write_csv(inter_data, file = file.path(results_dir, 'pfas_samples_intersect.csv'))
+```
+
+
